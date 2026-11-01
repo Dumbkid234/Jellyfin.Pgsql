@@ -54,6 +54,8 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
             .UseNpgsql(connectionBuilder.ToString(), pgSqlOptions =>
             {
                 pgSqlOptions.MigrationsAssembly(GetType().Assembly.FullName);
+                pgSqlOptions.UseQuerySplittingBehavior(Microsoft.EntityFrameworkCore.QuerySplittingBehavior.SplitQuery);
+                pgSqlOptions.EnableRetryOnFailure(5, TimeSpan.FromSeconds(10), null);
             });
 
         var enableSensitiveDataLogging = GetCustomDatabaseOption(customOptions, "EnableSensitiveDataLogging", e => e.Equals(bool.TrueString, StringComparison.OrdinalIgnoreCase), () => false);
