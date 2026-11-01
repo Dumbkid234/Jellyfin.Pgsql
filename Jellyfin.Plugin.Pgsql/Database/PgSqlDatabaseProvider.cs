@@ -34,6 +34,7 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <param name="logger">A logger.</param>
     public PgSqlDatabaseProvider(IApplicationPaths applicationPaths, ILogger<PgSqlDatabaseProvider> logger)
     {
+        try { SQLitePCL.Batteries_V2.Init(); } catch { }
         _applicationPaths = applicationPaths;
         _logger = logger;
     }
