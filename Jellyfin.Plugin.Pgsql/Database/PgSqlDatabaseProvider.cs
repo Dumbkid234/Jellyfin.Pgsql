@@ -50,6 +50,8 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
         var connectionBuilder = GetConnectionBuilder(customOptions);
         connectionBuilder.ApplicationName = $"jellyfin+{FileVersionInfo.GetVersionInfo(Assembly.GetEntryAssembly()!.Location).FileVersion}";
 
+        EnsureDuplicateProviderTrigger(connectionBuilder.ToString());
+
         options
             .UseNpgsql(connectionBuilder.ToString(), pgSqlOptions =>
             {
@@ -288,5 +290,42 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
         _logger.LogInformation("PostgreSQL connection string: {ConnectionString}", safeConnectionString);
 
         return connectionBuilder;
+    }
+
+    private void EnsureDuplicateProviderTrigger(string connectionString)
+    {
+        try
+        {
+            using var conn = new Npgsql.NpgsqlConnection(connectionString);
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                CREATE OR REPLACE FUNCTION trg_fn_clean_duplicate_providers()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    DELETE FROM ""BaseItemProviders""
+                    WHERE ""ItemId"" = NEW.""ItemId"" AND ""ProviderId"" = NEW.""ProviderId"";
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+
+                DO $$
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'BaseItemProviders') THEN
+                        DROP TRIGGER IF EXISTS trg_clean_duplicate_providers ON ""BaseItemProviders"";
+                        CREATE TRIGGER trg_clean_duplicate_providers
+                        BEFORE INSERT ON ""BaseItemProviders""
+                        FOR EACH ROW
+                        EXECUTE FUNCTION trg_fn_clean_duplicate_providers();
+                    END IF;
+                END $$;
+            ";
+            cmd.ExecuteNonQuery();
+            _logger.LogInformation("[PgSQL] Verified BaseItemProviders deduplication trigger.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[PgSQL] Could not automatically verify BaseItemProviders trigger.");
+        }
     }
 }
