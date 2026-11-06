@@ -63,7 +63,9 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                 pgSqlOptions.UseQuerySplittingBehavior(Microsoft.EntityFrameworkCore.QuerySplittingBehavior.SplitQuery);
                 pgSqlOptions.GetType().GetMethod("ReverseNullOrdering", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public)?.Invoke(pgSqlOptions, new object[] { true });
                 pgSqlOptions.CommandTimeout(120);
-            });
+            })
+            .AddInterceptors(ForceSplitQueryInterceptor.Instance)
+            .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.MultipleCollectionIncludeWarning));
 
         var enableSensitiveDataLogging = GetCustomDatabaseOption(customOptions, "EnableSensitiveDataLogging", e => e.Equals(bool.TrueString, StringComparison.OrdinalIgnoreCase), () => false);
         if (enableSensitiveDataLogging)
@@ -295,6 +297,32 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
         _logger.LogInformation("PostgreSQL connection string: {ConnectionString}", safeConnectionString);
 
         return connectionBuilder;
+    }
+
+    private sealed class ForceSplitQueryInterceptor : Microsoft.EntityFrameworkCore.Diagnostics.IQueryExpressionInterceptor
+    {
+        public static readonly ForceSplitQueryInterceptor Instance = new();
+
+        public System.Linq.Expressions.Expression QueryCompilationStarting(
+            System.Linq.Expressions.Expression queryExpression,
+            Microsoft.EntityFrameworkCore.Diagnostics.QueryExpressionEventData eventData)
+            => StripSingleQueryVisitor.Visitor.Visit(queryExpression);
+
+        private sealed class StripSingleQueryVisitor : System.Linq.Expressions.ExpressionVisitor
+        {
+            public static readonly StripSingleQueryVisitor Visitor = new();
+
+            protected override System.Linq.Expressions.Expression VisitMethodCall(System.Linq.Expressions.MethodCallExpression node)
+            {
+                if (node.Method.Name == nameof(Microsoft.EntityFrameworkCore.RelationalQueryableExtensions.AsSingleQuery) &&
+                    node.Method.DeclaringType == typeof(Microsoft.EntityFrameworkCore.RelationalQueryableExtensions))
+                {
+                    return Visit(node.Arguments[0]);
+                }
+
+                return base.VisitMethodCall(node);
+            }
+        }
     }
 
     private static int _optimizationsVerified;
