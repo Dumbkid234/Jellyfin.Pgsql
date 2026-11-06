@@ -314,6 +314,13 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
 
             protected override System.Linq.Expressions.Expression VisitMethodCall(System.Linq.Expressions.MethodCallExpression node)
             {
+                if (node.Method.Name == nameof(Microsoft.EntityFrameworkCore.DbFunctionsExtensions.Like) && node.Method.DeclaringType == typeof(Microsoft.EntityFrameworkCore.DbFunctionsExtensions))
+                {
+                    var paramTypes = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Select(node.Method.GetParameters(), p => p.ParameterType));
+                    var ilike = typeof(Microsoft.EntityFrameworkCore.NpgsqlDbFunctionsExtensions).GetMethod(nameof(Microsoft.EntityFrameworkCore.NpgsqlDbFunctionsExtensions.ILike), paramTypes);
+                    if (ilike is not null) return System.Linq.Expressions.Expression.Call(null, ilike, node.Arguments);
+                }
+
                 if (node.Method.Name == nameof(Microsoft.EntityFrameworkCore.RelationalQueryableExtensions.AsSingleQuery) &&
                     node.Method.DeclaringType == typeof(Microsoft.EntityFrameworkCore.RelationalQueryableExtensions))
                 {
