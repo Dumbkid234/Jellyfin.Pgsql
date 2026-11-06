@@ -49,14 +49,19 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
 
         var connectionBuilder = GetConnectionBuilder(customOptions);
         connectionBuilder.ApplicationName = $"jellyfin+{FileVersionInfo.GetVersionInfo(Assembly.GetEntryAssembly()!.Location).FileVersion}";
-
-        EnsureDuplicateProviderTrigger(connectionBuilder.ToString());
+        if (string.IsNullOrEmpty(connectionBuilder.Options))
+        {
+            connectionBuilder.Options = "-c jit=off -c synchronous_commit=off";
+        }
+        EnsurePostgresOptimizations(connectionBuilder.ToString());
 
         options
             .UseNpgsql(connectionBuilder.ToString(), pgSqlOptions =>
             {
                 pgSqlOptions.MigrationsAssembly(GetType().Assembly.FullName);
                 pgSqlOptions.UseQuerySplittingBehavior(Microsoft.EntityFrameworkCore.QuerySplittingBehavior.SplitQuery);
+                pgSqlOptions.ReverseNullOrdering();
+                pgSqlOptions.CommandTimeout(120);
             });
 
         var enableSensitiveDataLogging = GetCustomDatabaseOption(customOptions, "EnableSensitiveDataLogging", e => e.Equals(bool.TrueString, StringComparison.OrdinalIgnoreCase), () => false);
@@ -291,7 +296,7 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
         return connectionBuilder;
     }
 
-    private void EnsureDuplicateProviderTrigger(string connectionString)
+    private void EnsurePostgresOptimizations(string connectionString)
     {
         try
         {
@@ -308,6 +313,15 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                 END;
                 $$ LANGUAGE plpgsql;
 
+                CREATE OR REPLACE FUNCTION trg_fn_clean_duplicate_userdata()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    DELETE FROM ""UserData""
+                    WHERE ""ItemId"" = NEW.""ItemId"" AND ""UserId"" = NEW.""UserId"" AND ""CustomDataKey"" = NEW.""CustomDataKey"";
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+
                 DO $$
                 BEGIN
                     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'BaseItemProviders') THEN
@@ -317,14 +331,32 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                         FOR EACH ROW
                         EXECUTE FUNCTION trg_fn_clean_duplicate_providers();
                     END IF;
+
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'UserData') THEN
+                        DROP TRIGGER IF EXISTS trg_clean_duplicate_userdata ON ""UserData"";
+                        CREATE TRIGGER trg_clean_duplicate_userdata
+                        BEFORE INSERT ON ""UserData""
+                        FOR EACH ROW
+                        EXECUTE FUNCTION trg_fn_clean_duplicate_userdata();
+
+                        ALTER TABLE ""UserData"" SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_cost_limit = 1000);
+                    END IF;
+
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'PeopleBaseItemMap') THEN
+                        CREATE INDEX IF NOT EXISTS idx_peoplebaseitemmap_people_item ON ""PeopleBaseItemMap"" (""PeopleId"", ""ItemId"");
+                    END IF;
+
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'AncestorIds') THEN
+                        CREATE INDEX IF NOT EXISTS idx_ancestorids_parent_item ON ""AncestorIds"" (""ParentItemId"", ""ItemId"");
+                    END IF;
                 END $$;
             ";
             cmd.ExecuteNonQuery();
-            _logger.LogInformation("[PgSQL] Verified BaseItemProviders deduplication trigger.");
+            _logger.LogInformation("[PgSQL] Verified PostgreSQL triggers, composite indexes, and table optimizations.");
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "[PgSQL] Could not automatically verify BaseItemProviders trigger.");
+            _logger.LogWarning(ex, "[PgSQL] Could not automatically verify PostgreSQL optimizations.");
         }
     }
 }
