@@ -49,10 +49,11 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
 
         var connectionBuilder = GetConnectionBuilder(customOptions);
         connectionBuilder.ApplicationName = $"jellyfin+{FileVersionInfo.GetVersionInfo(Assembly.GetEntryAssembly()!.Location).FileVersion}";
-        if (string.IsNullOrEmpty(connectionBuilder.Options))
-        {
-            connectionBuilder.Options = "-c jit=off -c synchronous_commit=off";
-        }
+        connectionBuilder.Pooling = true;
+        if (connectionBuilder.MinPoolSize < 10) connectionBuilder.MinPoolSize = 10;
+        if (connectionBuilder.MaxPoolSize < 100) connectionBuilder.MaxPoolSize = 100;
+        if (connectionBuilder.CommandTimeout == 30) connectionBuilder.CommandTimeout = 120;
+        if (string.IsNullOrEmpty(connectionBuilder.Options)) connectionBuilder.Options = "-c jit=off -c synchronous_commit=off";
         EnsurePostgresOptimizations(connectionBuilder.ToString());
 
         options
@@ -60,7 +61,7 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
             {
                 pgSqlOptions.MigrationsAssembly(GetType().Assembly.FullName);
                 pgSqlOptions.UseQuerySplittingBehavior(Microsoft.EntityFrameworkCore.QuerySplittingBehavior.SplitQuery);
-                pgSqlOptions.ReverseNullOrdering();
+                pgSqlOptions.GetType().GetMethod("ReverseNullOrdering", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public)?.Invoke(pgSqlOptions, new object[] { true });
                 pgSqlOptions.CommandTimeout(120);
             });
 
@@ -296,66 +297,69 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
         return connectionBuilder;
     }
 
+    private static int _optimizationsVerified;
+
     private void EnsurePostgresOptimizations(string connectionString)
     {
+        if (System.Threading.Interlocked.CompareExchange(ref _optimizationsVerified, 1, 0) != 0) return;
         try
         {
             using var conn = new Npgsql.NpgsqlConnection(connectionString);
             conn.Open();
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"
-                CREATE OR REPLACE FUNCTION trg_fn_clean_duplicate_providers()
-                RETURNS TRIGGER AS $$
-                BEGIN
-                    DELETE FROM ""BaseItemProviders""
-                    WHERE ""ItemId"" = NEW.""ItemId"" AND ""ProviderId"" = NEW.""ProviderId"";
-                    RETURN NEW;
-                END;
-                $$ LANGUAGE plpgsql;
+            using (var checkCmd = conn.CreateCommand())
+            {
+                checkCmd.CommandText = "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'BaseItemProviders');";
+                if (checkCmd.ExecuteScalar() is not true)
+                {
+                    System.Threading.Interlocked.Exchange(ref _optimizationsVerified, 0);
+                    return;
+                }
+            }
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandTimeout = 120;
+                cmd.CommandText = @"
+                    CREATE OR REPLACE FUNCTION trg_fn_clean_duplicate_providers() RETURNS TRIGGER AS $$
+                    BEGIN
+                        DELETE FROM ""BaseItemProviders"" WHERE ""ItemId"" = NEW.""ItemId"" AND ""ProviderId"" = NEW.""ProviderId"";
+                        RETURN NEW;
+                    END; $$ LANGUAGE plpgsql;
 
-                CREATE OR REPLACE FUNCTION trg_fn_clean_duplicate_userdata()
-                RETURNS TRIGGER AS $$
-                BEGIN
-                    DELETE FROM ""UserData""
-                    WHERE ""ItemId"" = NEW.""ItemId"" AND ""UserId"" = NEW.""UserId"" AND ""CustomDataKey"" = NEW.""CustomDataKey"";
-                    RETURN NEW;
-                END;
-                $$ LANGUAGE plpgsql;
+                    CREATE OR REPLACE FUNCTION trg_fn_clean_duplicate_userdata() RETURNS TRIGGER AS $$
+                    BEGIN
+                        DELETE FROM ""UserData"" WHERE ""ItemId"" = NEW.""ItemId"" AND ""UserId"" = NEW.""UserId"" AND ""CustomDataKey"" = NEW.""CustomDataKey"";
+                        RETURN NEW;
+                    END; $$ LANGUAGE plpgsql;
 
-                DO $$
-                BEGIN
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'BaseItemProviders') THEN
-                        DROP TRIGGER IF EXISTS trg_clean_duplicate_providers ON ""BaseItemProviders"";
-                        CREATE TRIGGER trg_clean_duplicate_providers
-                        BEFORE INSERT ON ""BaseItemProviders""
-                        FOR EACH ROW
-                        EXECUTE FUNCTION trg_fn_clean_duplicate_providers();
-                    END IF;
-
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'UserData') THEN
-                        DROP TRIGGER IF EXISTS trg_clean_duplicate_userdata ON ""UserData"";
-                        CREATE TRIGGER trg_clean_duplicate_userdata
-                        BEFORE INSERT ON ""UserData""
-                        FOR EACH ROW
-                        EXECUTE FUNCTION trg_fn_clean_duplicate_userdata();
-
-                        ALTER TABLE ""UserData"" SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_cost_limit = 1000);
-                    END IF;
-
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'PeopleBaseItemMap') THEN
-                        CREATE INDEX IF NOT EXISTS idx_peoplebaseitemmap_people_item ON ""PeopleBaseItemMap"" (""PeopleId"", ""ItemId"");
-                    END IF;
-
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'AncestorIds') THEN
-                        CREATE INDEX IF NOT EXISTS idx_ancestorids_parent_item ON ""AncestorIds"" (""ParentItemId"", ""ItemId"");
-                    END IF;
-                END $$;
-            ";
-            cmd.ExecuteNonQuery();
-            _logger.LogInformation("[PgSQL] Verified PostgreSQL triggers, composite indexes, and table optimizations.");
+                    DO $$ BEGIN
+                        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_clean_duplicate_providers') THEN
+                            CREATE TRIGGER trg_clean_duplicate_providers BEFORE INSERT ON ""BaseItemProviders"" FOR EACH ROW EXECUTE FUNCTION trg_fn_clean_duplicate_providers();
+                        END IF;
+                        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'UserData') THEN
+                            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_clean_duplicate_userdata') THEN
+                                CREATE TRIGGER trg_clean_duplicate_userdata BEFORE INSERT ON ""UserData"" FOR EACH ROW EXECUTE FUNCTION trg_fn_clean_duplicate_userdata();
+                            END IF;
+                        END IF;
+                    END $$;";
+                cmd.ExecuteNonQuery();
+            }
+            using (var idx1 = conn.CreateCommand())
+            {
+                idx1.CommandTimeout = 300;
+                idx1.CommandText = @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_peoplebaseitemmap_people_item ON ""PeopleBaseItemMap"" (""PeopleId"", ""ItemId"");";
+                idx1.ExecuteNonQuery();
+            }
+            using (var idx2 = conn.CreateCommand())
+            {
+                idx2.CommandTimeout = 300;
+                idx2.CommandText = @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ancestorids_parent_item ON ""AncestorIds"" (""ParentItemId"", ""ItemId"");";
+                idx2.ExecuteNonQuery();
+            }
+            _logger.LogInformation("[PgSQL] Verified PostgreSQL triggers and composite indexes.");
         }
         catch (Exception ex)
         {
+            System.Threading.Interlocked.Exchange(ref _optimizationsVerified, 0);
             _logger.LogWarning(ex, "[PgSQL] Could not automatically verify PostgreSQL optimizations.");
         }
     }
