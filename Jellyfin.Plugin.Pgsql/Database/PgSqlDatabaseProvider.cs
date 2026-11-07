@@ -390,6 +390,18 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                 idx2.CommandText = @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ancestorids_parent_item ON ""AncestorIds"" (""ParentItemId"", ""ItemId"");";
                 idx2.ExecuteNonQuery();
             }
+            using (var idx3 = conn.CreateCommand())
+            {
+                idx3.CommandTimeout = 300;
+                idx3.CommandText = @"CREATE INDEX CONCURRENTLY IF NOT EXISTS ""IX_BaseItems_ExtraType_OwnerId"" ON ""BaseItems"" (""ExtraType"", ""OwnerId"") WHERE ""ExtraType"" IS NOT NULL;";
+                idx3.ExecuteNonQuery();
+            }
+            using (var idx4 = conn.CreateCommand())
+            {
+                idx4.CommandTimeout = 300;
+                idx4.CommandText = @"CREATE INDEX CONCURRENTLY IF NOT EXISTS ""IX_BaseItems_OwnerId"" ON ""BaseItems"" (""OwnerId"") WHERE ""OwnerId"" IS NOT NULL;";
+                idx4.ExecuteNonQuery();
+            }
             _logger.LogInformation("[PgSQL] Verified PostgreSQL triggers and composite indexes.");
         }
         catch (Exception ex)
