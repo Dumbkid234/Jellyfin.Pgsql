@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,20 +13,24 @@ using Jellyfin.Database.Implementations.DbConfiguration;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Configuration;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Microsoft.Extensions.Logging;
 using Npgsql;
 
 namespace Jellyfin.Plugin.Pgsql.Database;
 
 /// <summary>
-/// Configures jellyfin to use an Postgres database.
+/// Configures Jellyfin to use a PostgreSQL database.
 /// </summary>
 [JellyfinDatabaseProviderKey("Jellyfin-PgSql")]
 public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
 {
     private const string BackupFolderName = "PgsqlBackups";
+    private static int _optimizationsVerified;
     private readonly ILogger<PgSqlDatabaseProvider> _logger;
     private readonly IApplicationPaths _applicationPaths;
+    private DatabaseConfigurationOptions? _databaseConfiguration;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PgSqlDatabaseProvider"/> class.
@@ -34,7 +39,15 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <param name="logger">A logger.</param>
     public PgSqlDatabaseProvider(IApplicationPaths applicationPaths, ILogger<PgSqlDatabaseProvider> logger)
     {
-        try { SQLitePCL.Batteries_V2.Init(); } catch { }
+        try
+        {
+            SQLitePCL.Batteries_V2.Init();
+        }
+        catch
+        {
+            // Ignore if already initialized by host.
+        }
+
         _applicationPaths = applicationPaths;
         _logger = logger;
     }
@@ -45,32 +58,34 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc/>
     public void Initialise(DbContextOptionsBuilder options, DatabaseConfigurationOptions databaseConfiguration)
     {
+        _databaseConfiguration = databaseConfiguration;
         var customOptions = databaseConfiguration.CustomProviderOptions?.Options;
 
-        var connectionBuilder = GetConnectionBuilder(customOptions);
+        var connectionBuilder = GetConnectionBuilder(databaseConfiguration);
         connectionBuilder.ApplicationName = $"jellyfin+{FileVersionInfo.GetVersionInfo(Assembly.GetEntryAssembly()!.Location).FileVersion}";
-        connectionBuilder.Pooling = true;
-        if (connectionBuilder.MinPoolSize < 10) connectionBuilder.MinPoolSize = 10;
-        if (connectionBuilder.MaxPoolSize < 100) connectionBuilder.MaxPoolSize = 100;
-        if (connectionBuilder.CommandTimeout == 30) connectionBuilder.CommandTimeout = 120;
-        if (string.IsNullOrEmpty(connectionBuilder.Options)) connectionBuilder.Options = "-c jit=off -c synchronous_commit=off";
+
+        var safeConn = new NpgsqlConnectionStringBuilder(connectionBuilder.ToString()) { Password = null }.ToString();
+        _logger.LogInformation("PostgreSQL connection string: {ConnectionString}", safeConn);
+
         EnsurePostgresOptimizations(connectionBuilder.ToString());
 
         options
             .UseNpgsql(connectionBuilder.ToString(), pgSqlOptions =>
             {
                 pgSqlOptions.MigrationsAssembly(GetType().Assembly.FullName);
-                pgSqlOptions.UseQuerySplittingBehavior(Microsoft.EntityFrameworkCore.QuerySplittingBehavior.SplitQuery);
-                pgSqlOptions.GetType().GetMethod("ReverseNullOrdering", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public)?.Invoke(pgSqlOptions, new object[] { true });
-                pgSqlOptions.CommandTimeout(120);
+                pgSqlOptions.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+                pgSqlOptions.GetType()
+                    .GetMethod("ReverseNullOrdering", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+                    ?.Invoke(pgSqlOptions, new object[] { true });
+                pgSqlOptions.CommandTimeout(connectionBuilder.CommandTimeout);
             })
             .AddInterceptors(ForceSplitQueryInterceptor.Instance)
-            .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.MultipleCollectionIncludeWarning));
+            .ConfigureWarnings(w => w.Ignore(RelationalEventId.MultipleCollectionIncludeWarning));
 
         var enableSensitiveDataLogging = GetCustomDatabaseOption(customOptions, "EnableSensitiveDataLogging", e => e.Equals(bool.TrueString, StringComparison.OrdinalIgnoreCase), () => false);
         if (enableSensitiveDataLogging)
         {
-            options.EnableSensitiveDataLogging(enableSensitiveDataLogging);
+            options.EnableSensitiveDataLogging(true);
             _logger.LogInformation("EnableSensitiveDataLogging is enabled on PostgreSQL connection");
         }
     }
@@ -97,20 +112,19 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc/>
     public void OnModelCreating(ModelBuilder modelBuilder)
     {
-        // Use C collation for consistent case-sensitive behavior matching SQLite BINARY
         modelBuilder.UseCollation("C");
 
-        // Configure all DateTime properties to ensure UTC for PostgreSQL compatibility, matching SQLite provider
+        var utcConverter = new ValueConverter<DateTime, DateTime>(
+            v => v.Kind == DateTimeKind.Utc ? v : (v.Kind == DateTimeKind.Local ? v.ToUniversalTime() : DateTime.SpecifyKind(v, DateTimeKind.Utc)),
+            v => DateTime.SpecifyKind(v, DateTimeKind.Utc));
+
         foreach (var entityType in modelBuilder.Model.GetEntityTypes())
         {
             foreach (var property in entityType.GetProperties())
             {
                 if (property.ClrType == typeof(DateTime) || property.ClrType == typeof(DateTime?))
                 {
-                    property.SetValueConverter(
-                        new Microsoft.EntityFrameworkCore.Storage.ValueConversion.ValueConverter<DateTime, DateTime>(
-                            v => v.ToUniversalTime(),
-                            v => DateTime.SpecifyKind(v, DateTimeKind.Utc)));
+                    property.SetValueConverter(utcConverter);
                 }
             }
         }
@@ -119,10 +133,8 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc/>
     public Task RunShutdownTask(CancellationToken cancellationToken)
     {
-        // Clear Npgsql connection pools on shutdown
         NpgsqlConnection.ClearAllPools();
         _logger.LogInformation("PostgreSQL connection pools cleared on shutdown");
-
         return Task.CompletedTask;
     }
 
@@ -138,16 +150,16 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
         var backupFolder = Path.Combine(_applicationPaths.DataPath, BackupFolderName);
         Directory.CreateDirectory(backupFolder);
 
-        var connectionBuilder = GetConnectionBuilder(null);
+        var connectionBuilder = GetConnectionBuilder(_databaseConfiguration);
         var backupFile = Path.Combine(backupFolder, $"{key}_{connectionBuilder.Database}.sql");
 
-        var process = new Process
+        using var process = new Process
         {
             StartInfo = new ProcessStartInfo
             {
                 FileName = "pg_dump",
-                Arguments = $"--host={connectionBuilder.Host} --port={connectionBuilder.Port} --username={connectionBuilder.Username} --dbname={connectionBuilder.Database} --file=\"{backupFile}\" --no-password --verbose --clean --if-exists",
-                Environment = { ["PGPASSWORD"] = connectionBuilder.Password },
+                Arguments = $"--host={connectionBuilder.Host} --port={connectionBuilder.Port} --username={connectionBuilder.Username} --dbname={connectionBuilder.Database} --file=\"{backupFile}\" --no-password --clean --if-exists",
+                Environment = { ["PGPASSWORD"] = connectionBuilder.Password ?? string.Empty },
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -156,13 +168,15 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
         };
 
         _logger.LogInformation("Starting PostgreSQL backup: {BackupFile}", backupFile);
-
         process.Start();
-        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+
+        var stdOutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        var stdErrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+        await Task.WhenAll(stdOutTask, stdErrTask, process.WaitForExitAsync(cancellationToken)).ConfigureAwait(false);
 
         if (process.ExitCode != 0)
         {
-            var error = await process.StandardError.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+            var error = await stdErrTask.ConfigureAwait(false);
             _logger.LogError("pg_dump failed with exit code {ExitCode}: {Error}", process.ExitCode, error);
             throw new InvalidOperationException($"pg_dump failed: {error}");
         }
@@ -176,7 +190,7 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
     {
         NpgsqlConnection.ClearAllPools();
 
-        var connectionBuilder = GetConnectionBuilder(null);
+        var connectionBuilder = GetConnectionBuilder(_databaseConfiguration);
         var backupFile = Path.Combine(_applicationPaths.DataPath, BackupFolderName, $"{key}_{connectionBuilder.Database}.sql");
 
         if (!File.Exists(backupFile))
@@ -185,13 +199,13 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
             return;
         }
 
-        var process = new Process
+        using var process = new Process
         {
             StartInfo = new ProcessStartInfo
             {
                 FileName = "psql",
                 Arguments = $"--host={connectionBuilder.Host} --port={connectionBuilder.Port} --username={connectionBuilder.Username} --dbname={connectionBuilder.Database} --file=\"{backupFile}\" --no-password --quiet",
-                Environment = { ["PGPASSWORD"] = connectionBuilder.Password },
+                Environment = { ["PGPASSWORD"] = connectionBuilder.Password ?? string.Empty },
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -200,13 +214,15 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
         };
 
         _logger.LogInformation("Starting PostgreSQL restore from: {BackupFile}", backupFile);
-
         process.Start();
-        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+
+        var stdOutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        var stdErrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+        await Task.WhenAll(stdOutTask, stdErrTask, process.WaitForExitAsync(cancellationToken)).ConfigureAwait(false);
 
         if (process.ExitCode != 0)
         {
-            var error = await process.StandardError.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+            var error = await stdErrTask.ConfigureAwait(false);
             _logger.LogError("psql restore failed with exit code {ExitCode}: {Error}", process.ExitCode, error);
             throw new InvalidOperationException($"psql restore failed: {error}");
         }
@@ -217,7 +233,7 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc/>
     public Task DeleteBackup(string key)
     {
-        var connectionBuilder = GetConnectionBuilder(null);
+        var connectionBuilder = GetConnectionBuilder(_databaseConfiguration);
         var backupFile = Path.Combine(_applicationPaths.DataPath, BackupFolderName, $"{key}_{connectionBuilder.Database}.sql");
 
         if (!File.Exists(backupFile))
@@ -235,96 +251,90 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
     public async Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames)
     {
         ArgumentNullException.ThrowIfNull(tableNames);
-
-        var truncateQueries = new List<string>();
-        foreach (var tableName in tableNames)
-        {
-            truncateQueries.Add($"TRUNCATE TABLE \"{tableName}\" RESTART IDENTITY CASCADE;");
-        }
-
-        var truncateAllQuery = string.Join('\n', truncateQueries);
-
+        var truncateAllQuery = string.Join('\n', tableNames.Select(t => $"TRUNCATE TABLE \"{t}\" RESTART IDENTITY CASCADE;"));
         await dbContext.Database.ExecuteSqlRawAsync(truncateAllQuery).ConfigureAwait(false);
         _logger.LogInformation("PostgreSQL database tables purged successfully");
     }
 
-    private T? GetCustomDatabaseOption<T>(ICollection<CustomDatabaseOption>? options, string key, Func<string, T> converter, Func<T>? defaultValue = null)
+    private static T? GetCustomDatabaseOption<T>(ICollection<CustomDatabaseOption>? options, string key, Func<string, T> converter, Func<T>? defaultValue = null)
     {
-        if (options is null)
-        {
-            return defaultValue is not null ? defaultValue() : default;
-        }
-
-        var value = options.FirstOrDefault(e => e.Key.Equals(key, StringComparison.OrdinalIgnoreCase));
-        if (value is null)
-        {
-            return defaultValue is not null ? defaultValue() : default;
-        }
-
-        return converter(value.Value);
+        var value = options?.FirstOrDefault(e => e.Key.Equals(key, StringComparison.OrdinalIgnoreCase));
+        return value is not null ? converter(value.Value) : (defaultValue is not null ? defaultValue() : default);
     }
 
-    private NpgsqlConnectionStringBuilder GetConnectionBuilder(ICollection<CustomDatabaseOption>? options)
+    private static NpgsqlConnectionStringBuilder GetConnectionBuilder(DatabaseConfigurationOptions? databaseConfiguration)
     {
-        var includeErrorDetail = GetCustomDatabaseOption(options, "IncludeErrorDetail", e => e.Equals(bool.TrueString, StringComparison.OrdinalIgnoreCase), () => false);
-        var logParameters = GetCustomDatabaseOption(options, "LogParameters", e => e.Equals(bool.TrueString, StringComparison.OrdinalIgnoreCase), () => false);
+        var options = databaseConfiguration?.CustomProviderOptions?.Options;
+        var rawConnStr = databaseConfiguration?.CustomProviderOptions?.ConnectionString;
+        var cb = string.IsNullOrWhiteSpace(rawConnStr) ? new NpgsqlConnectionStringBuilder() : new NpgsqlConnectionStringBuilder(rawConnStr);
 
-        var connectionBuilder = new NpgsqlConnectionStringBuilder
-        {
-            Host = Environment.GetEnvironmentVariable("POSTGRES_HOST") ?? "jellyfin",
-            Port = int.Parse(Environment.GetEnvironmentVariable("POSTGRES_PORT") ?? "5432", CultureInfo.InvariantCulture),
-            Database = Environment.GetEnvironmentVariable("POSTGRES_DB") ?? "jellyfin",
-            Username = Environment.GetEnvironmentVariable("POSTGRES_USER") ?? "jellyfin",
-            Password = Environment.GetEnvironmentVariable("POSTGRES_PASSWORD") ?? throw new InvalidOperationException("PostgreSQL password must be provided via POSTGRES_PASSWORD environment variable")
-        };
+        var envHost = Environment.GetEnvironmentVariable("POSTGRES_HOST");
+        var envPort = Environment.GetEnvironmentVariable("POSTGRES_PORT");
+        var envDb = Environment.GetEnvironmentVariable("POSTGRES_DB");
+        var envUser = Environment.GetEnvironmentVariable("POSTGRES_USER");
+        var envPass = Environment.GetEnvironmentVariable("POSTGRES_PASSWORD");
+        var envSsl = Environment.GetEnvironmentVariable("POSTGRES_SSLMODE");
+        var envTimeout = Environment.GetEnvironmentVariable("POSTGRES_COMMAND_TIMEOUT");
 
-        if (includeErrorDetail)
-        {
-            connectionBuilder.IncludeErrorDetail = includeErrorDetail;
-        }
+        if (!string.IsNullOrWhiteSpace(envHost)) cb.Host = envHost;
+        else if (string.IsNullOrWhiteSpace(cb.Host)) cb.Host = "jellyfin";
 
-        if (logParameters)
-        {
-            connectionBuilder.LogParameters = logParameters;
-        }
+        if (int.TryParse(envPort, NumberStyles.Integer, CultureInfo.InvariantCulture, out var port)) cb.Port = port;
+        else if (cb.Port <= 0) cb.Port = 5432;
 
-        // Log the full connection string without password
-        var safeConnectionString = new NpgsqlConnectionStringBuilder(connectionBuilder.ToString())
-        {
-            Password = null
-        }.ToString();
+        if (!string.IsNullOrWhiteSpace(envDb)) cb.Database = envDb;
+        else if (string.IsNullOrWhiteSpace(cb.Database)) cb.Database = "jellyfin";
 
-        _logger.LogInformation("PostgreSQL connection string: {ConnectionString}", safeConnectionString);
+        if (!string.IsNullOrWhiteSpace(envUser)) cb.Username = envUser;
+        else if (string.IsNullOrWhiteSpace(cb.Username)) cb.Username = "jellyfin";
 
-        return connectionBuilder;
+        if (!string.IsNullOrWhiteSpace(envPass)) cb.Password = envPass;
+        if (string.IsNullOrEmpty(cb.Password)) throw new InvalidOperationException("PostgreSQL password must be provided via POSTGRES_PASSWORD or database.xml");
+
+        if (!string.IsNullOrWhiteSpace(envSsl) && Enum.TryParse<SslMode>(envSsl, true, out var sslMode)) cb.SslMode = sslMode;
+        if (int.TryParse(envTimeout, NumberStyles.Integer, CultureInfo.InvariantCulture, out var cmdTimeout)) cb.CommandTimeout = cmdTimeout;
+
+        cb.Pooling = true;
+        if (cb.MinPoolSize < 10) cb.MinPoolSize = 10;
+        if (cb.MaxPoolSize == 100) cb.MaxPoolSize = 50;
+        if (cb.ConnectionIdleLifetime == 300) cb.ConnectionIdleLifetime = 300;
+        if (cb.CommandTimeout == 30) cb.CommandTimeout = 120;
+        if (string.IsNullOrEmpty(cb.Options)) cb.Options = "-c jit=off -c synchronous_commit=off";
+
+        if (GetCustomDatabaseOption(options, "IncludeErrorDetail", e => e.Equals(bool.TrueString, StringComparison.OrdinalIgnoreCase), () => false)) cb.IncludeErrorDetail = true;
+        if (GetCustomDatabaseOption(options, "LogParameters", e => e.Equals(bool.TrueString, StringComparison.OrdinalIgnoreCase), () => false)) cb.LogParameters = true;
+
+        return cb;
     }
 
-    private sealed class ForceSplitQueryInterceptor : Microsoft.EntityFrameworkCore.Diagnostics.IQueryExpressionInterceptor
+    private sealed class ForceSplitQueryInterceptor : IQueryExpressionInterceptor
     {
         public static readonly ForceSplitQueryInterceptor Instance = new();
 
-        public System.Linq.Expressions.Expression QueryCompilationStarting(
-            System.Linq.Expressions.Expression queryExpression,
-            Microsoft.EntityFrameworkCore.Diagnostics.QueryExpressionEventData eventData)
+        public Expression QueryCompilationStarting(Expression queryExpression, QueryExpressionEventData eventData)
             => StripSingleQueryVisitor.Visitor.Visit(queryExpression);
 
-        private sealed class StripSingleQueryVisitor : System.Linq.Expressions.ExpressionVisitor
+        private sealed class StripSingleQueryVisitor : ExpressionVisitor
         {
             public static readonly StripSingleQueryVisitor Visitor = new();
 
-            protected override System.Linq.Expressions.Expression VisitMethodCall(System.Linq.Expressions.MethodCallExpression node)
+            protected override Expression VisitMethodCall(MethodCallExpression node)
             {
-                if (node.Method.Name == nameof(Microsoft.EntityFrameworkCore.DbFunctionsExtensions.Like) && node.Method.DeclaringType == typeof(Microsoft.EntityFrameworkCore.DbFunctionsExtensions))
-                {
-                    var paramTypes = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Select(node.Method.GetParameters(), p => p.ParameterType));
-                    var ilike = typeof(Microsoft.EntityFrameworkCore.NpgsqlDbFunctionsExtensions).GetMethod(nameof(Microsoft.EntityFrameworkCore.NpgsqlDbFunctionsExtensions.ILike), paramTypes);
-                    if (ilike is not null) return System.Linq.Expressions.Expression.Call(null, ilike, node.Arguments);
-                }
-
-                if (node.Method.Name == nameof(Microsoft.EntityFrameworkCore.RelationalQueryableExtensions.AsSingleQuery) &&
-                    node.Method.DeclaringType == typeof(Microsoft.EntityFrameworkCore.RelationalQueryableExtensions))
+                if (node.Method.Name == nameof(RelationalQueryableExtensions.AsSingleQuery) &&
+                    node.Method.DeclaringType == typeof(RelationalQueryableExtensions))
                 {
                     return Visit(node.Arguments[0]);
+                }
+
+                if (node.Method.Name == nameof(DbFunctionsExtensions.Like) &&
+                    node.Method.DeclaringType == typeof(DbFunctionsExtensions))
+                {
+                    var paramTypes = node.Method.GetParameters().Select(p => p.ParameterType).ToArray();
+                    var ilike = typeof(NpgsqlDbFunctionsExtensions).GetMethod(nameof(NpgsqlDbFunctionsExtensions.ILike), paramTypes);
+                    if (ilike is not null)
+                    {
+                        return Expression.Call(null, ilike, Visit(node.Arguments));
+                    }
                 }
 
                 return base.VisitMethodCall(node);
@@ -332,36 +342,42 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
         }
     }
 
-    private static int _optimizationsVerified;
-
     private void EnsurePostgresOptimizations(string connectionString)
     {
-        if (System.Threading.Interlocked.CompareExchange(ref _optimizationsVerified, 1, 0) != 0) return;
+        if (Interlocked.CompareExchange(ref _optimizationsVerified, 1, 0) != 0)
+        {
+            return;
+        }
+
         try
         {
-            using var conn = new Npgsql.NpgsqlConnection(connectionString);
+            using var conn = new NpgsqlConnection(connectionString);
             conn.Open();
+
             using (var checkCmd = conn.CreateCommand())
             {
                 checkCmd.CommandText = "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'BaseItemProviders');";
                 if (checkCmd.ExecuteScalar() is not true)
                 {
-                    System.Threading.Interlocked.Exchange(ref _optimizationsVerified, 0);
+                    Interlocked.Exchange(ref _optimizationsVerified, 0);
                     return;
                 }
             }
+
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandTimeout = 120;
                 cmd.CommandText = @"
                     CREATE OR REPLACE FUNCTION trg_fn_clean_duplicate_providers() RETURNS TRIGGER AS $$
                     BEGIN
+                        PERFORM pg_advisory_xact_lock(hashtext(NEW.""ItemId""::text), hashtext(NEW.""ProviderId""));
                         DELETE FROM ""BaseItemProviders"" WHERE ""ItemId"" = NEW.""ItemId"" AND ""ProviderId"" = NEW.""ProviderId"";
                         RETURN NEW;
                     END; $$ LANGUAGE plpgsql;
 
                     CREATE OR REPLACE FUNCTION trg_fn_clean_duplicate_userdata() RETURNS TRIGGER AS $$
                     BEGIN
+                        PERFORM pg_advisory_xact_lock(hashtext(NEW.""ItemId""::text || NEW.""CustomDataKey""), hashtext(NEW.""UserId""::text));
                         DELETE FROM ""UserData"" WHERE ""ItemId"" = NEW.""ItemId"" AND ""UserId"" = NEW.""UserId"" AND ""CustomDataKey"" = NEW.""CustomDataKey"";
                         RETURN NEW;
                     END; $$ LANGUAGE plpgsql;
@@ -374,39 +390,36 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                             IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_clean_duplicate_userdata') THEN
                                 CREATE TRIGGER trg_clean_duplicate_userdata BEFORE INSERT ON ""UserData"" FOR EACH ROW EXECUTE FUNCTION trg_fn_clean_duplicate_userdata();
                             END IF;
+                            IF NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = 'UserData' AND c.reloptions IS NOT NULL) THEN
+                                ALTER TABLE ""UserData"" SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_cost_limit = 1000);
+                            END IF;
                         END IF;
                     END $$;";
                 cmd.ExecuteNonQuery();
             }
-            using (var idx1 = conn.CreateCommand())
+
+            string[] indexCommands =
             {
-                idx1.CommandTimeout = 300;
-                idx1.CommandText = @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_peoplebaseitemmap_people_item ON ""PeopleBaseItemMap"" (""PeopleId"", ""ItemId"");";
-                idx1.ExecuteNonQuery();
-            }
-            using (var idx2 = conn.CreateCommand())
+                @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_peoplebaseitemmap_people_item ON ""PeopleBaseItemMap"" (""PeopleId"", ""ItemId"");",
+                @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ancestorids_parent_item ON ""AncestorIds"" (""ParentItemId"", ""ItemId"");",
+                @"CREATE INDEX CONCURRENTLY IF NOT EXISTS ""IX_BaseItems_ExtraType_OwnerId"" ON ""BaseItems"" (""ExtraType"", ""OwnerId"") WHERE ""ExtraType"" IS NOT NULL;",
+                @"CREATE INDEX CONCURRENTLY IF NOT EXISTS ""IX_BaseItems_OwnerId"" ON ""BaseItems"" (""OwnerId"") WHERE ""OwnerId"" IS NOT NULL;",
+                @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_baseitems_type_name ON ""BaseItems"" (""Type"", ""Name"");"
+            };
+
+            foreach (var indexSql in indexCommands)
             {
-                idx2.CommandTimeout = 300;
-                idx2.CommandText = @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ancestorids_parent_item ON ""AncestorIds"" (""ParentItemId"", ""ItemId"");";
-                idx2.ExecuteNonQuery();
+                using var idxCmd = conn.CreateCommand();
+                idxCmd.CommandTimeout = 300;
+                idxCmd.CommandText = indexSql;
+                idxCmd.ExecuteNonQuery();
             }
-            using (var idx3 = conn.CreateCommand())
-            {
-                idx3.CommandTimeout = 300;
-                idx3.CommandText = @"CREATE INDEX CONCURRENTLY IF NOT EXISTS ""IX_BaseItems_ExtraType_OwnerId"" ON ""BaseItems"" (""ExtraType"", ""OwnerId"") WHERE ""ExtraType"" IS NOT NULL;";
-                idx3.ExecuteNonQuery();
-            }
-            using (var idx4 = conn.CreateCommand())
-            {
-                idx4.CommandTimeout = 300;
-                idx4.CommandText = @"CREATE INDEX CONCURRENTLY IF NOT EXISTS ""IX_BaseItems_OwnerId"" ON ""BaseItems"" (""OwnerId"") WHERE ""OwnerId"" IS NOT NULL;";
-                idx4.ExecuteNonQuery();
-            }
-            _logger.LogInformation("[PgSQL] Verified PostgreSQL triggers and composite indexes.");
+
+            _logger.LogInformation("[PgSQL] Verified PostgreSQL triggers, autovacuum settings, and composite indexes.");
         }
         catch (Exception ex)
         {
-            System.Threading.Interlocked.Exchange(ref _optimizationsVerified, 0);
+            Interlocked.Exchange(ref _optimizationsVerified, 0);
             _logger.LogWarning(ex, "[PgSQL] Could not automatically verify PostgreSQL optimizations.");
         }
     }

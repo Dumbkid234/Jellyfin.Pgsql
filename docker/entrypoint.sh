@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+[ -n "$UMASK" ] && umask "$UMASK"
+
 DATA_DIR="${JELLYFIN_DATA_DIR:-/config}"
 CONFIG_DIR="${JELLYFIN_CONFIG_DIR:-/config/config}"
 PLUGIN_DIR="$DATA_DIR/plugins/PostgreSQL"
@@ -8,9 +10,7 @@ BACKUP_DIR="$DATA_DIR/data/PgsqlBackups"
 
 rm -rf "$PLUGIN_DIR"
 mkdir -p "$PLUGIN_DIR" "$CONFIG_DIR"
-
 cp -rf /opt/jellyfin-pgsql/* "$PLUGIN_DIR/"
-find "$PLUGIN_DIR" -type f ! -name "Jellyfin.Plugin.Pgsql*" ! -name "Npgsql*" -delete
 
 if [ -d "$BACKUP_DIR" ]; then
     ls -1t "$BACKUP_DIR"/*.sql 2>/dev/null | tail -n +3 | xargs -r rm -f
@@ -23,7 +23,7 @@ if [ -n "$POSTGRES_HOST" ]; then
     export PGUSER="${POSTGRES_USER:-jellyfin}"
     export PGPASSWORD="${POSTGRES_PASSWORD}"
 
-    CONN_STR="Host=${POSTGRES_HOST};Port=${PGPORT};Database=${PGDATABASE};Username=${PGUSER};Password=${PGPASSWORD};Pooling=true;Minimum Pool Size=10;Maximum Pool Size=100;Connection Idle Lifetime=300;Command Timeout=120;Options=-c jit=off -c synchronous_commit=off;"
+    CONN_STR="Host=${POSTGRES_HOST};Port=${PGPORT};Database=${PGDATABASE};Username=${PGUSER};Password=${PGPASSWORD};Pooling=true;Minimum Pool Size=10;Maximum Pool Size=50;Connection Idle Lifetime=300;Command Timeout=120;Options=-c jit=off -c synchronous_commit=off;"
     [ -n "$POSTGRES_SSLMODE" ] && CONN_STR="${CONN_STR}SSL Mode=${POSTGRES_SSLMODE};"
     [ -n "$POSTGRES_TRUSTSERVERCERTIFICATE" ] && CONN_STR="${CONN_STR}Trust Server Certificate=${POSTGRES_TRUSTSERVERCERTIFICATE};"
     [ -n "$POSTGRES_COMMAND_TIMEOUT" ] && CONN_STR="${CONN_STR}Command Timeout=${POSTGRES_COMMAND_TIMEOUT};"
