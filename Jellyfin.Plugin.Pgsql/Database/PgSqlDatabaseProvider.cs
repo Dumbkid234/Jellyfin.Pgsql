@@ -39,6 +39,8 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <param name="logger">A logger.</param>
     public PgSqlDatabaseProvider(IApplicationPaths applicationPaths, ILogger<PgSqlDatabaseProvider> logger)
     {
+        AppContext.SetSwitch("Npgsql.DisableDateTimeInfinityConversions", true);
+
         try
         {
             SQLitePCL.Batteries_V2.Init();
@@ -73,6 +75,7 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
             .UseNpgsql(connectionBuilder.ToString(), pgSqlOptions =>
             {
                 pgSqlOptions.MigrationsAssembly(GetType().Assembly.FullName);
+                pgSqlOptions.ExecutionStrategy(dependencies => new BufferingExecutionStrategy(dependencies));
                 pgSqlOptions.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
                 pgSqlOptions.GetType()
                     .GetMethod("ReverseNullOrdering", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
@@ -103,7 +106,8 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
         {
             if (context.Database.IsNpgsql())
             {
-                await context.Database.ExecuteSqlRawAsync("VACUUM ANALYZE", cancellationToken).ConfigureAwait(false);
+                var hasItems = await context.BaseItems.AnyAsync(e => !e.IsFolder && e.Type != "PLACEHOLDER", cancellationToken).ConfigureAwait(false);
+                await context.Database.ExecuteSqlRawAsync(hasItems ? "VACUUM ANALYZE" : "VACUUM", cancellationToken).ConfigureAwait(false);
                 _logger.LogInformation("PostgreSQL database optimized successfully");
             }
         }
@@ -159,7 +163,7 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
             {
                 FileName = "pg_dump",
                 Arguments = $"--host={connectionBuilder.Host} --port={connectionBuilder.Port} --username={connectionBuilder.Username} --dbname={connectionBuilder.Database} --file=\"{backupFile}\" --no-password --clean --if-exists",
-                Environment = { ["PGPASSWORD"] = connectionBuilder.Password ?? string.Empty },
+                Environment = { ["PGPASSWORD"] = connectionBuilder.Password ?? string.Empty, ["PGSSLMODE"] = ToLibpqSslMode(connectionBuilder.SslMode) },
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -204,8 +208,8 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
             StartInfo = new ProcessStartInfo
             {
                 FileName = "psql",
-                Arguments = $"--host={connectionBuilder.Host} --port={connectionBuilder.Port} --username={connectionBuilder.Username} --dbname={connectionBuilder.Database} --file=\"{backupFile}\" --no-password --quiet",
-                Environment = { ["PGPASSWORD"] = connectionBuilder.Password ?? string.Empty },
+                Arguments = $"--host={connectionBuilder.Host} --port={connectionBuilder.Port} --username={connectionBuilder.Username} --dbname={connectionBuilder.Database} --no-password --quiet --set=ON_ERROR_STOP=1 --single-transaction --command=\"DROP SCHEMA public CASCADE; CREATE SCHEMA public AUTHORIZATION pg_database_owner; GRANT USAGE ON SCHEMA public TO PUBLIC;\" --file=\"{backupFile}\"",
+                Environment = { ["PGPASSWORD"] = connectionBuilder.Password ?? string.Empty, ["PGSSLMODE"] = ToLibpqSslMode(connectionBuilder.SslMode) },
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -234,7 +238,8 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
     public Task DeleteBackup(string key)
     {
         var connectionBuilder = GetConnectionBuilder(_databaseConfiguration);
-        var backupFile = Path.Combine(_applicationPaths.DataPath, BackupFolderName, $"{key}_{connectionBuilder.Database}.sql");
+        var backupFolder = Path.Combine(_applicationPaths.DataPath, BackupFolderName);
+        var backupFile = Path.Combine(backupFolder, $"{key}_{connectionBuilder.Database}.sql");
 
         if (!File.Exists(backupFile))
         {
@@ -242,8 +247,16 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
             return Task.CompletedTask;
         }
 
-        File.Delete(backupFile);
-        _logger.LogInformation("Deleted backup file: {BackupFile}", backupFile);
+        foreach (var olderBackup in Directory.EnumerateFiles(backupFolder, $"*_{connectionBuilder.Database}.sql"))
+        {
+            if (!string.Equals(olderBackup, backupFile, StringComparison.Ordinal))
+            {
+                File.Delete(olderBackup);
+                _logger.LogInformation("Deleted older backup file: {BackupFile}", olderBackup);
+            }
+        }
+
+        _logger.LogInformation("Keeping latest pre-migration backup: {BackupFile}", backupFile);
         return Task.CompletedTask;
     }
 
@@ -255,6 +268,16 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
         await dbContext.Database.ExecuteSqlRawAsync(truncateAllQuery).ConfigureAwait(false);
         _logger.LogInformation("PostgreSQL database tables purged successfully");
     }
+
+    private static string ToLibpqSslMode(SslMode sslMode) => sslMode switch
+    {
+        SslMode.Disable => "disable",
+        SslMode.Allow => "allow",
+        SslMode.Require => "require",
+        SslMode.VerifyCA => "verify-ca",
+        SslMode.VerifyFull => "verify-full",
+        _ => "prefer"
+    };
 
     private static T? GetCustomDatabaseOption<T>(ICollection<CustomDatabaseOption>? options, string key, Func<string, T> converter, Func<T>? defaultValue = null)
     {
@@ -293,11 +316,11 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
 
         if (!string.IsNullOrWhiteSpace(envSsl) && Enum.TryParse<SslMode>(envSsl, true, out var sslMode)) cb.SslMode = sslMode;
         if (int.TryParse(envTimeout, NumberStyles.Integer, CultureInfo.InvariantCulture, out var cmdTimeout)) cb.CommandTimeout = cmdTimeout;
+        if (cb.GssEncryptionMode == GssEncryptionMode.Prefer) cb.GssEncryptionMode = GssEncryptionMode.Disable;
 
         cb.Pooling = true;
         if (cb.MinPoolSize < 10) cb.MinPoolSize = 10;
         if (cb.MaxPoolSize == 100) cb.MaxPoolSize = 50;
-        if (cb.ConnectionIdleLifetime == 300) cb.ConnectionIdleLifetime = 300;
         if (cb.CommandTimeout == 30) cb.CommandTimeout = 120;
         if (string.IsNullOrEmpty(cb.Options)) cb.Options = "-c jit=off -c synchronous_commit=off";
 
@@ -368,6 +391,9 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
             {
                 cmd.CommandTimeout = 120;
                 cmd.CommandText = @"
+                    CREATE OR REPLACE FUNCTION public.uuid_smaller(uuid, uuid) RETURNS uuid LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS 'SELECT CASE WHEN $1 < $2 THEN $1 ELSE $2 END';
+                    CREATE OR REPLACE FUNCTION public.uuid_larger(uuid, uuid) RETURNS uuid LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS 'SELECT CASE WHEN $1 > $2 THEN $1 ELSE $2 END';
+
                     CREATE OR REPLACE FUNCTION trg_fn_clean_duplicate_providers() RETURNS TRIGGER AS $$
                     BEGIN
                         PERFORM pg_advisory_xact_lock(hashtext(NEW.""ItemId""::text), hashtext(NEW.""ProviderId""));
@@ -383,6 +409,12 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                     END; $$ LANGUAGE plpgsql;
 
                     DO $$ BEGIN
+                        IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'min' AND oidvectortypes(proargtypes) = 'uuid') THEN
+                            CREATE AGGREGATE public.min(uuid) (SFUNC = public.uuid_smaller, STYPE = uuid, COMBINEFUNC = public.uuid_smaller, SORTOP = <, PARALLEL = SAFE);
+                        END IF;
+                        IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'max' AND oidvectortypes(proargtypes) = 'uuid') THEN
+                            CREATE AGGREGATE public.max(uuid) (SFUNC = public.uuid_larger, STYPE = uuid, COMBINEFUNC = public.uuid_larger, SORTOP = >, PARALLEL = SAFE);
+                        END IF;
                         IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_clean_duplicate_providers') THEN
                             CREATE TRIGGER trg_clean_duplicate_providers BEFORE INSERT ON ""BaseItemProviders"" FOR EACH ROW EXECUTE FUNCTION trg_fn_clean_duplicate_providers();
                         END IF;
@@ -396,6 +428,33 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                         END IF;
                     END $$;";
                 cmd.ExecuteNonQuery();
+            }
+
+            var invalidIndexes = new List<string>();
+            using (var invCmd = conn.CreateCommand())
+            {
+                invCmd.CommandText = @"
+                    SELECT c.relname
+                    FROM pg_index x
+                    JOIN pg_class c ON c.oid = x.indexrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public'
+                      AND NOT x.indisvalid
+                      AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = x.indexrelid);";
+                using var reader = invCmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    invalidIndexes.Add(reader.GetString(0));
+                }
+            }
+
+            foreach (var invalidIdx in invalidIndexes)
+            {
+                using var dropCmd = conn.CreateCommand();
+                dropCmd.CommandTimeout = 300;
+                dropCmd.CommandText = $"DROP INDEX CONCURRENTLY IF EXISTS \"{invalidIdx.Replace("\"", "\"\"", StringComparison.Ordinal)}\";";
+                dropCmd.ExecuteNonQuery();
+                _logger.LogWarning("[PgSQL] Dropped invalid index {IndexName} so it can be rebuilt cleanly.", invalidIdx);
             }
 
             string[] indexCommands =
@@ -415,7 +474,7 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                 idxCmd.ExecuteNonQuery();
             }
 
-            _logger.LogInformation("[PgSQL] Verified PostgreSQL triggers, autovacuum settings, and composite indexes.");
+            _logger.LogInformation("[PgSQL] Verified PostgreSQL triggers, UUID aggregates, autovacuum settings, and composite indexes.");
         }
         catch (Exception ex)
         {
