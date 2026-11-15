@@ -401,6 +401,13 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                         RETURN NEW;
                     END; $$ LANGUAGE plpgsql;
 
+                    CREATE OR REPLACE FUNCTION trg_fn_clean_duplicate_keyframedata() RETURNS TRIGGER AS $$
+                    BEGIN
+                        PERFORM pg_advisory_xact_lock(hashtext(NEW.""ItemId""::text), 1);
+                        DELETE FROM ""KeyframeData"" WHERE ""ItemId"" = NEW.""ItemId"";
+                        RETURN NEW;
+                    END; $$ LANGUAGE plpgsql;
+
                     CREATE OR REPLACE FUNCTION trg_fn_clean_duplicate_userdata() RETURNS TRIGGER AS $$
                     BEGIN
                         PERFORM pg_advisory_xact_lock(hashtext(NEW.""ItemId""::text || NEW.""CustomDataKey""), hashtext(NEW.""UserId""::text));
@@ -431,6 +438,11 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                         END IF;
                         IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'max' AND oidvectortypes(proargtypes) = 'uuid') THEN
                             CREATE AGGREGATE public.max(uuid) (SFUNC = public.uuid_larger, STYPE = uuid, COMBINEFUNC = public.uuid_larger, SORTOP = >, PARALLEL = SAFE);
+                        END IF;
+                        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'KeyframeData') THEN
+                            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_clean_duplicate_keyframedata') THEN
+                                CREATE TRIGGER trg_clean_duplicate_keyframedata BEFORE INSERT ON ""KeyframeData"" FOR EACH ROW EXECUTE FUNCTION trg_fn_clean_duplicate_keyframedata();
+                            END IF;
                         END IF;
                         IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_clean_duplicate_providers') THEN
                             CREATE TRIGGER trg_clean_duplicate_providers BEFORE INSERT ON ""BaseItemProviders"" FOR EACH ROW EXECUTE FUNCTION trg_fn_clean_duplicate_providers();
