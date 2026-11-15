@@ -408,7 +408,24 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                         RETURN NEW;
                     END; $$ LANGUAGE plpgsql;
 
-                    DO $$ BEGIN
+                    DO $$
+                    DECLARE
+                        tbl RECORD;
+                    BEGIN
+                        IF coalesce(obj_description('public.trg_fn_clean_duplicate_providers()'::regprocedure, 'pg_proc'), '') <> 'jf_inf_clean_v1' THEN
+                            FOR tbl IN
+                                SELECT c.table_name,
+                                    string_agg(format('%I = CASE WHEN %I = ''-infinity'' THEN ''0001-01-01 00:00:00+00''::%s WHEN %I = ''infinity'' THEN ''9999-12-31 23:59:59.999999+00''::%s ELSE %I END', c.column_name, c.column_name, c.data_type, c.column_name, c.data_type, c.column_name), ', ') AS sets,
+                                    string_agg(format('%I IN (''-infinity'', ''infinity'')', c.column_name), ' OR ') AS wheres
+                                FROM information_schema.columns c
+                                JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+                                WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE' AND c.data_type IN ('timestamp with time zone', 'timestamp without time zone')
+                                GROUP BY c.table_name
+                            LOOP
+                                EXECUTE format('UPDATE public.%I SET %s WHERE %s;', tbl.table_name, tbl.sets, tbl.wheres);
+                            END LOOP;
+                            COMMENT ON FUNCTION public.trg_fn_clean_duplicate_providers() IS 'jf_inf_clean_v1';
+                        END IF;
                         IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'min' AND oidvectortypes(proargtypes) = 'uuid') THEN
                             CREATE AGGREGATE public.min(uuid) (SFUNC = public.uuid_smaller, STYPE = uuid, COMBINEFUNC = public.uuid_smaller, SORTOP = <, PARALLEL = SAFE);
                         END IF;
