@@ -322,7 +322,15 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
         if (cb.MinPoolSize < 10) cb.MinPoolSize = 10;
         if (cb.MaxPoolSize == 100) cb.MaxPoolSize = 50;
         if (cb.CommandTimeout == 30) cb.CommandTimeout = 120;
-        if (string.IsNullOrEmpty(cb.Options)) cb.Options = "-c jit=off -c synchronous_commit=off";
+        if (string.IsNullOrEmpty(cb.Options))
+        {
+            var opts = new List<string>();
+            var envJit = Environment.GetEnvironmentVariable("POSTGRES_JIT");
+            var envSync = Environment.GetEnvironmentVariable("POSTGRES_SYNCHRONOUS_COMMIT");
+            if (!string.Equals(envJit, "on", StringComparison.OrdinalIgnoreCase) && !string.Equals(envJit, "true", StringComparison.OrdinalIgnoreCase)) opts.Add("-c jit=off");
+            if (!string.Equals(envSync, "on", StringComparison.OrdinalIgnoreCase) && !string.Equals(envSync, "true", StringComparison.OrdinalIgnoreCase)) opts.Add("-c synchronous_commit=off");
+            if (opts.Count > 0) cb.Options = string.Join(' ', opts);
+        }
 
         if (GetCustomDatabaseOption(options, "IncludeErrorDetail", e => e.Equals(bool.TrueString, StringComparison.OrdinalIgnoreCase), () => false)) cb.IncludeErrorDetail = true;
         if (GetCustomDatabaseOption(options, "LogParameters", e => e.Equals(bool.TrueString, StringComparison.OrdinalIgnoreCase), () => false)) cb.LogParameters = true;

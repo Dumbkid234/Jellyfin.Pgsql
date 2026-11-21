@@ -1,81 +1,70 @@
-# The Unofficial Postgre SQL adapter for Jellyfin Server
+# Jellyfin.Pgsql (Jellyfin 12.4 / .NET 10 / PostgreSQL 18)
 
-This plugin adds postgres SQL support to [Jellyfin Server](https://github.com/jellyfin/jellyfin).
+A production-hardened fork of [JPVenson/Jellyfin.Pgsql](https://github.com/JPVenson/Jellyfin.Pgsql) built on top of the stock official `jellyfin/jellyfin:12.4` image with `.NET 10` and `Npgsql 10.0.3`, tested against a 225,000+ item library on PostgreSQL 18.
 
+## Pre-Built Docker Image
 
-> [!IMPORTANT]
-> Pleae note that there are several additional steps required to make this work and it is to be considered __HIGHLY__ experimental.
+~~~bash
+docker pull ghcr.io/dumbkid234/jellyfin.pgsql:12.4
+~~~
 
-# How to use it
+## Key Fixes & Optimizations Included
 
-You can use your existing Jellyfin compose file and change the image accordingly to: `ghcr.io/jpvenson/jellyfin.pgsql:10.11.8-1`.
+* **Jellyfin 12.4 & .NET 10 Native:** Compiled against Jellyfin `12.4.0` packages and `Npgsql.EntityFrameworkCore.PostgreSQL 10.0.3`, with build-time DLL deduplication and `postgresql-client-18` for `pg_dump` / `psql`.
+* **Non-MARS Query Buffering (`BufferingExecutionStrategy`):** Buffers `NpgsqlDataReader` results while still allowing Jellyfin's user-initiated `BeginTransaction()` calls, preventing `NpgsqlOperationInProgressException` during migrations (such as `MigrateRatingLevels`) and runtime loops.
+* **`SplitQuery` + `.AsSingleQuery()` Interceptor & `ILIKE`:** Enables `QuerySplittingBehavior.SplitQuery`, strips hardcoded `.AsSingleQuery()` calls via `IQueryExpressionInterceptor` to prevent multi-table Cartesian memory spikes, and rewrites `EF.Functions.Like` to `NpgsqlDbFunctionsExtensions.ILike` for case-insensitive trigram searches.
+* **SQLite Compatibility:** Enables Npgsql `ReverseNullOrdering` (matching SQLite `NULL` sorting on `DatePlayed` / `NextUp`), disables `-infinity`/`infinity` `DateTime` conversions (with a one-time automatic startup migration for legacy `-infinity` rows), fixes `DateTimeKind.Unspecified` UTC conversion, and adds PostgreSQL `min(uuid)` / `max(uuid)` aggregates.
+* **SQLite Sibling Plugin Bridge:** Calls `SQLitePCL.Batteries_V2.Init()` on provider startup so SQLite-based plugins like **Playback Reporting** run cleanly alongside PostgreSQL.
+* **Self-Healing Startup Triggers & Non-Blocking Indexes:** Automatically verifies advisory-locked `BEFORE INSERT` deduplication triggers (`BaseItemProviders`, `UserData`, `KeyframeData`), drops any `INVALID` indexes before creation, configures `UserData` autovacuum, and creates `CONCURRENTLY` indexes for `PeopleBaseItemMap`, `AncestorIds`, and `BaseItems` (`ExtraType`, `OwnerId`, and `(Type, Name)`).
+* **Safe, Portable Backups & Restores:** Drains `pg_dump` / `psql` pipes concurrently to prevent 64 KB pipe deadlocks, omits role ownership (`--no-owner --no-privileges`) so non-superuser roles can restore, restores atomically inside a single transaction, and automatically rotates old backups.
 
-You need to add the connection parameters as enviornment variables in your compose file:
+## Docker Compose Example
 
-```yaml
-
+~~~yaml
 services:
-  jellyfin:
-    image: ghcr.io/jpvenson/jellyfin.pgsql:10.11.8-1
-    volumes:
-        - /path/to/config:/config
-        - /path/to/cache:/cache
-        - /path/to/media:/media
+  postgres:
+    image: postgres:18
+    shm_size: 4g # Important: Docker's 64MB default breaks Postgres parallel queries on large libraries
     environment:
-        - POSTGRES_HOST=
-        - POSTGRES_PORT=
-        - POSTGRES_DB=jellyfin
-        - POSTGRES_USER=jellyfin
-        - POSTGRES_PASSWORD=jellyfin
-      # Optional settings bellow, uncomment if you want to connect using SSL
-      # - POSTGRES_SSLMODE=Require
-      # - POSTGRES_TRUSTSERVERCERTIFICATE=true
-```
+      - POSTGRES_DB=jellyfin
+      - POSTGRES_USER=jellyfin
+      - POSTGRES_PASSWORD=changeme
+    volumes:
+      - ./postgres-data:/var/lib/postgresql
+    restart: unless-stopped
 
-# Build
+  jellyfin:
+    image: ghcr.io/dumbkid234/jellyfin.pgsql:12.4
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=jellyfin
+      - POSTGRES_USER=jellyfin
+      - POSTGRES_PASSWORD=changeme
+      # Optional tuning overrides:
+      # - POSTGRES_COMMAND_TIMEOUT=120
+      # - POSTGRES_SSLMODE=Prefer
+      # - POSTGRES_JIT=off
+      # - POSTGRES_SYNCHRONOUS_COMMIT=off
+    volumes:
+      - ./config:/config
+      - ./cache:/cache
+      - ./media:/media
+    ports:
+      - 8096:8096
+    restart: unless-stopped
+~~~
 
-Checkout the Jellyfin submodule.
-Use dotnet build to build the plugin.
-Place the plugin in the `plugins` folder of the Jellyfin app.
-Update the `database.xml` file to switch to the plugin as its database provider:
+## Environment Variables
 
-```xml
-<?xml version="1.0" encoding="utf-8"?>
-<DatabaseConfigurationOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-  <DatabaseType>PLUGIN_PROVIDER</DatabaseType>
-  <CustomProviderOptions>
-    <PluginAssembly>../../../Jellyfin.Plugin.Pgsql/bin/debug/net9.0/Jellyfin.Plugin.Pgsql.dll</PluginAssembly>
-    <PluginName>PostgreSQL</PluginName>
-    <ConnectionString>CONNECTION_STRING_TO_LOCAL_PGSQL_SERVER</ConnectionString>
-  </CustomProviderOptions>
-  <LockingBehavior>NoLock</LockingBehavior>
-</DatabaseConfigurationOptions>
-
-```
-
-Launch your Jellyfin server.
-
-# Add migration
-Run `dotnet ef migrations add {MIGRATION_NAME} --project "/workspaces/Jellyfin.Pgsql/Jellyfin.Plugin.Pgsql" -- --migration-provider Jellyfin-PgSql`
-
-# Release flow
-
-To create a new release, first sync all Jellyfin server changes then create a new migration as seen above. After that create a new efbundle:
-`dotnet ef migrations bundle -o docker/jellyfin.PgsqlMigrator.dll -r linux-x64 --self-contained --project "/workspaces/Jellyfin.Pgsql/Jellyfin.Plugin.Pgsql" --  --migration-provider Jellyfin-PgSql`
-Then build the container.
-
-# Migration Instructions (ADVANCED, UNTESTED)
-
-To migrate your existing Jellyfin instance to a custom database (not using the docker image) follow the steps IN THIS ORDER.
-
-1. Download the Jellyfin PGSQL container and configure it to point to an existing empty database and empty config directory. DO NOT USE YOUR EXISTING DATA OR SQLITE LIBRARY CONFIGURE A FULLY CLEAR INSTANCE.
-2. Run Jellyfin once with it configured to your empty database, this will seed the database and its migration history.
-3. Stop your Jellyfin instance after it has been started once (no need to fully configure it via the setup wizard). If you did not get the setup wizard then you did something wrong!
-4. Install the pgloader tool `apt install pgloader` or see https://pgloader.readthedocs.io/en/latest/install.html.
-5. Download the [jellyfindb.load](/docker/jellyfindb.load) file
-6. Adapt the `jellyfindb.load` file accordingly to point towards your old jellyfin.db and your postgres instance. See https://pgloader.readthedocs.io/en/latest/ref/sqlite.html
-7. Use the load file in `jellyfindb.load` to transfer your sqlite db into the postgres db like `pgloader /jellyfin-pgsql/jellyfindb.load`.
-8. Move your old Data back to the Jellyfin directories
-9. Start Jellyfin
-
-If you get an error regarding a missing `__EFMigrationsHistory` you did not start Jellyfin with a clear state.
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `POSTGRES_HOST` | `jellyfin` | PostgreSQL hostname or IP |
+| `POSTGRES_PORT` | `5432` | PostgreSQL port |
+| `POSTGRES_DB` | `jellyfin` | Database name |
+| `POSTGRES_USER` | `jellyfin` | PostgreSQL role/username |
+| `POSTGRES_PASSWORD` | *(required)* | Database password (never written to `database.xml`) |
+| `POSTGRES_SSLMODE` | `Prefer` | `Disable`, `Allow`, `Prefer`, `Require`, `VerifyCA`, `VerifyFull` |
+| `POSTGRES_COMMAND_TIMEOUT` | `120` | Query timeout in seconds (`0` = unlimited) |
+| `POSTGRES_JIT` | `off` | Set to `on` to re-enable PostgreSQL JIT |
+| `POSTGRES_SYNCHRONOUS_COMMIT` | `off` | Set to `on` for strict per-transaction synchronous WAL flushes |

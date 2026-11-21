@@ -23,10 +23,9 @@ if [ -n "$POSTGRES_HOST" ]; then
     export PGUSER="${POSTGRES_USER:-jellyfin}"
     export PGPASSWORD="${POSTGRES_PASSWORD}"
 
-    CONN_STR="Host=${POSTGRES_HOST};Port=${PGPORT};Database=${PGDATABASE};Username=${PGUSER};Password=${PGPASSWORD};Pooling=true;Minimum Pool Size=10;Maximum Pool Size=50;Connection Idle Lifetime=300;Command Timeout=120;Options=-c jit=off -c synchronous_commit=off;"
+    PG_TIMEOUT="${POSTGRES_COMMAND_TIMEOUT:-120}"
+    CONN_STR="Host=${POSTGRES_HOST};Port=${PGPORT};Database=${PGDATABASE};Username=${PGUSER};Pooling=true;Minimum Pool Size=10;Maximum Pool Size=50;Connection Idle Lifetime=300;Command Timeout=${PG_TIMEOUT};"
     [ -n "$POSTGRES_SSLMODE" ] && CONN_STR="${CONN_STR}SSL Mode=${POSTGRES_SSLMODE};"
-    [ -n "$POSTGRES_TRUSTSERVERCERTIFICATE" ] && CONN_STR="${CONN_STR}Trust Server Certificate=${POSTGRES_TRUSTSERVERCERTIFICATE};"
-    [ -n "$POSTGRES_COMMAND_TIMEOUT" ] && CONN_STR="${CONN_STR}Command Timeout=${POSTGRES_COMMAND_TIMEOUT};"
 
     for TARGET_XML in "$CONFIG_DIR/database.xml" "$DATA_DIR/database.xml"; do
         if [ ! -f "$TARGET_XML" ]; then

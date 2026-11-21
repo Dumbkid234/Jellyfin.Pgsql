@@ -31,6 +31,8 @@ jobs:
         with:
           context: .
           push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: |
             ghcr.io/dumbkid234/jellyfin.pgsql:12.4
             ghcr.io/dumbkid234/jellyfin.pgsql:latest
