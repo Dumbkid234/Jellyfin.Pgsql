@@ -494,17 +494,29 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                 _logger.LogWarning("[PgSQL] Dropped invalid index {IndexName} so it can be rebuilt cleanly.", invalidIdx);
             }
 
-            string[] indexCommands =
+            (string Table, string Sql)[] indexDefinitions =
             {
-                @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_peoplebaseitemmap_people_item ON ""PeopleBaseItemMap"" (""PeopleId"", ""ItemId"");",
-                @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ancestorids_parent_item ON ""AncestorIds"" (""ParentItemId"", ""ItemId"");",
-                @"CREATE INDEX CONCURRENTLY IF NOT EXISTS ""IX_BaseItems_ExtraType_OwnerId"" ON ""BaseItems"" (""ExtraType"", ""OwnerId"") WHERE ""ExtraType"" IS NOT NULL;",
-                @"CREATE INDEX CONCURRENTLY IF NOT EXISTS ""IX_BaseItems_OwnerId"" ON ""BaseItems"" (""OwnerId"") WHERE ""OwnerId"" IS NOT NULL;",
-                @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_baseitems_type_name ON ""BaseItems"" (""Type"", ""Name"");"
+                ("PeopleBaseItemMap", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_peoplebaseitemmap_people_item ON ""PeopleBaseItemMap"" (""PeopleId"", ""ItemId"");"),
+                ("AncestorIds", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ancestorids_parent_item ON ""AncestorIds"" (""ParentItemId"", ""ItemId"");"),
+                ("BaseItems", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS ""IX_BaseItems_ExtraType_OwnerId"" ON ""BaseItems"" (""ExtraType"", ""OwnerId"") WHERE ""ExtraType"" IS NOT NULL;"),
+                ("BaseItems", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS ""IX_BaseItems_OwnerId"" ON ""BaseItems"" (""OwnerId"") WHERE ""OwnerId"" IS NOT NULL;"),
+                ("BaseItems", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_baseitems_type_name ON ""BaseItems"" (""Type"", ""Name"");"),
+                ("MediaSegments", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_mediasegments_item_type ON ""MediaSegments"" (""ItemId"", ""Type"");"),
+                ("Peoples", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_peoples_lower_name_type ON ""Peoples"" (lower(""Name""), ""PersonType"");"),
+                ("BaseItems", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_baseitems_seasonid ON ""BaseItems"" (""SeasonId"", ""IsVirtualItem"") WHERE (""SeasonId"" IS NOT NULL);")
             };
 
-            foreach (var indexSql in indexCommands)
+            foreach (var (tableName, indexSql) in indexDefinitions)
             {
+                using (var tblCmd = conn.CreateCommand())
+                {
+                    tblCmd.CommandText = $"SELECT to_regclass('public.\"{tableName}\"') IS NOT NULL;";
+                    if (tblCmd.ExecuteScalar() is not true)
+                    {
+                        continue;
+                    }
+                }
+
                 using var idxCmd = conn.CreateCommand();
                 idxCmd.CommandTimeout = 300;
                 idxCmd.CommandText = indexSql;
