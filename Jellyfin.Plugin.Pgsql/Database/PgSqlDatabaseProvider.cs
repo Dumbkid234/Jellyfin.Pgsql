@@ -342,19 +342,73 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
     {
         public static readonly ForceSplitQueryInterceptor Instance = new();
 
-        public Expression QueryCompilationStarting(Expression queryExpression, QueryExpressionEventData eventData)
-            => StripSingleQueryVisitor.Visitor.Visit(queryExpression);
+        private static readonly MethodInfo AsSingleQueryMethod = typeof(RelationalQueryableExtensions)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .First(m => m.Name == nameof(RelationalQueryableExtensions.AsSingleQuery) && m.IsGenericMethodDefinition && m.GetParameters().Length == 1);
 
-        private sealed class StripSingleQueryVisitor : ExpressionVisitor
+        public Expression QueryCompilationStarting(Expression queryExpression, QueryExpressionEventData eventData)
         {
-            public static readonly StripSingleQueryVisitor Visitor = new();
+            var analyzer = new QueryAnalyzerVisitor();
+            analyzer.Visit(queryExpression);
+
+            var useSingleQuery = analyzer.HasTake && analyzer.IncludeCount is >= 2 and <= 3 && !analyzer.HasHeavyInclude;
+            return new AdaptiveQueryVisitor(useSingleQuery).Visit(queryExpression);
+        }
+
+        private sealed class QueryAnalyzerVisitor : ExpressionVisitor
+        {
+            public bool HasTake { get; private set; }
+
+            public int IncludeCount { get; private set; }
+
+            public bool HasHeavyInclude { get; private set; }
+
+            protected override Expression VisitMethodCall(MethodCallExpression node)
+            {
+                if (node.Method.DeclaringType == typeof(Queryable) && node.Method.Name == nameof(Queryable.Take))
+                {
+                    HasTake = true;
+                }
+                else if (node.Method.DeclaringType == typeof(EntityFrameworkQueryableExtensions) &&
+                         (node.Method.Name == nameof(EntityFrameworkQueryableExtensions.Include) ||
+                          node.Method.Name == nameof(EntityFrameworkQueryableExtensions.ThenInclude)))
+                {
+                    IncludeCount++;
+                    if (node.Arguments.Count > 1)
+                    {
+                        var nav = node.Arguments[1].ToString();
+                        if (nav.Contains("MediaStream", StringComparison.OrdinalIgnoreCase) ||
+                            nav.Contains("Chapter", StringComparison.OrdinalIgnoreCase) ||
+                            nav.Contains("Trickplay", StringComparison.OrdinalIgnoreCase) ||
+                            nav.Contains("People", StringComparison.OrdinalIgnoreCase) ||
+                            nav.Contains("ItemValue", StringComparison.OrdinalIgnoreCase) ||
+                            nav.Contains("Attachment", StringComparison.OrdinalIgnoreCase))
+                        {
+                            HasHeavyInclude = true;
+                        }
+                    }
+                }
+
+                return base.VisitMethodCall(node);
+            }
+        }
+
+        private sealed class AdaptiveQueryVisitor : ExpressionVisitor
+        {
+            private readonly bool _useSingleQuery;
+            private bool _wrappedSingleQuery;
+
+            public AdaptiveQueryVisitor(bool useSingleQuery)
+            {
+                _useSingleQuery = useSingleQuery;
+            }
 
             protected override Expression VisitMethodCall(MethodCallExpression node)
             {
                 if (node.Method.Name == nameof(RelationalQueryableExtensions.AsSingleQuery) &&
                     node.Method.DeclaringType == typeof(RelationalQueryableExtensions))
                 {
-                    return Visit(node.Arguments[0]);
+                    return _useSingleQuery ? base.VisitMethodCall(node) : Visit(node.Arguments[0]);
                 }
 
                 if (node.Method.Name == nameof(DbFunctionsExtensions.Like) &&
@@ -365,6 +419,20 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                     if (ilike is not null)
                     {
                         return Expression.Call(null, ilike, Visit(node.Arguments));
+                    }
+                }
+
+                if (_useSingleQuery && !_wrappedSingleQuery &&
+                    node.Method.DeclaringType == typeof(Queryable) &&
+                    node.Method.Name == nameof(Queryable.Take) &&
+                    node.Type.IsGenericType)
+                {
+                    var elementType = node.Type.GetGenericArguments()[0];
+                    if (elementType.IsClass && elementType != typeof(string))
+                    {
+                        _wrappedSingleQuery = true;
+                        var visitedTake = base.VisitMethodCall(node);
+                        return Expression.Call(AsSingleQueryMethod.MakeGenericMethod(elementType), visitedTake);
                     }
                 }
 
@@ -401,6 +469,8 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                 cmd.CommandText = @"
                     CREATE OR REPLACE FUNCTION public.uuid_smaller(uuid, uuid) RETURNS uuid LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS 'SELECT CASE WHEN $1 < $2 THEN $1 ELSE $2 END';
                     CREATE OR REPLACE FUNCTION public.uuid_larger(uuid, uuid) RETURNS uuid LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS 'SELECT CASE WHEN $1 > $2 THEN $1 ELSE $2 END';
+                    CREATE OR REPLACE FUNCTION public.min_uuid_state(uuid, uuid) RETURNS uuid LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS 'SELECT CASE WHEN $1 < $2 THEN $1 ELSE $2 END';
+                    CREATE OR REPLACE FUNCTION public.max_uuid_state(uuid, uuid) RETURNS uuid LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS 'SELECT CASE WHEN $1 > $2 THEN $1 ELSE $2 END';
 
                     CREATE OR REPLACE FUNCTION trg_fn_clean_duplicate_providers() RETURNS TRIGGER AS $$
                     BEGIN
@@ -503,7 +573,8 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                 ("BaseItems", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_baseitems_type_name ON ""BaseItems"" (""Type"", ""Name"");"),
                 ("MediaSegments", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_mediasegments_item_type ON ""MediaSegments"" (""ItemId"", ""Type"");"),
                 ("Peoples", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_peoples_lower_name_type ON ""Peoples"" (lower(""Name""), ""PersonType"");"),
-                ("BaseItems", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_baseitems_seasonid ON ""BaseItems"" (""SeasonId"", ""IsVirtualItem"") WHERE (""SeasonId"" IS NOT NULL);")
+                ("BaseItems", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_baseitems_seasonid ON ""BaseItems"" (""SeasonId"", ""IsVirtualItem"") WHERE (""SeasonId"" IS NOT NULL);"),
+                ("BaseItems", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_baseitems_dedup_cover ON ""BaseItems"" (""TopParentId"", ""IsVirtualItem"", ""Type"", ""PresentationUniqueKey"") INCLUDE (""Id"", ""PrimaryVersionId"") WHERE (""OwnerId"" IS NULL OR ""ExtraType"" IS NOT NULL);")
             };
 
             foreach (var (tableName, indexSql) in indexDefinitions)
@@ -521,6 +592,13 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                 idxCmd.CommandTimeout = 300;
                 idxCmd.CommandText = indexSql;
                 idxCmd.ExecuteNonQuery();
+            }
+
+            using (var statCmd = conn.CreateCommand())
+            {
+                statCmd.CommandTimeout = 120;
+                statCmd.CommandText = @"CREATE STATISTICS IF NOT EXISTS stat_baseitems_dedup (ndistinct, dependencies, mcv) ON ""TopParentId"", ""IsVirtualItem"", ""Type"", ""PresentationUniqueKey"" FROM ""BaseItems"";";
+                statCmd.ExecuteNonQuery();
             }
 
             _logger.LogInformation("[PgSQL] Verified PostgreSQL triggers, UUID aggregates, autovacuum settings, and composite indexes.");
