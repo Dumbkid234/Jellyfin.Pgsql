@@ -351,7 +351,7 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
             var analyzer = new QueryAnalyzerVisitor();
             analyzer.Visit(queryExpression);
 
-            var useSingleQuery = analyzer.HasTake && analyzer.IncludeCount is >= 2 and <= 3 && !analyzer.HasHeavyInclude;
+            var useSingleQuery = analyzer.HasTake && analyzer.IncludeCount is >= 2 and <= 4 && !analyzer.HasHeavyInclude;
             return new AdaptiveQueryVisitor(useSingleQuery).Visit(queryExpression);
         }
 
@@ -574,7 +574,7 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
                 ("MediaSegments", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_mediasegments_item_type ON ""MediaSegments"" (""ItemId"", ""Type"");"),
                 ("Peoples", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_peoples_lower_name_type ON ""Peoples"" (lower(""Name""), ""PersonType"");"),
                 ("BaseItems", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_baseitems_seasonid ON ""BaseItems"" (""SeasonId"", ""IsVirtualItem"") WHERE (""SeasonId"" IS NOT NULL);"),
-                ("BaseItems", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_baseitems_dedup_cover ON ""BaseItems"" (""TopParentId"", ""IsVirtualItem"", ""Type"", ""PresentationUniqueKey"") INCLUDE (""Id"", ""PrimaryVersionId"") WHERE (""OwnerId"" IS NULL OR ""ExtraType"" IS NOT NULL);")
+                ("BaseItems", @"CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_baseitems_dedup_cover_v2 ON ""BaseItems"" (""TopParentId"", ""IsVirtualItem"", ""Type"", ""PresentationUniqueKey"") INCLUDE (""Id"", ""PrimaryVersionId"", ""SeriesId"") WHERE (""OwnerId"" IS NULL OR ""ExtraType"" IS NOT NULL);")
             };
 
             foreach (var (tableName, indexSql) in indexDefinitions)
