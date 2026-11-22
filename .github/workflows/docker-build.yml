@@ -4,6 +4,9 @@ on:
   push:
     branches: [ "feature/12.0_unstable", "main" ]
     tags: [ "[0-9]*.*" ]
+  schedule:
+    # Check once daily at 06:00 UTC; only rebuilds if jellyfin/jellyfin:12.4 actually changed
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 jobs:
@@ -27,7 +30,60 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check if upstream jellyfin/jellyfin base image changed
+        id: check
+        run: |
+          BASE_TAG=$(awk '/^FROM jellyfin\/jellyfin:/{sub(/^FROM /,""); print $1; exit}' Dockerfile)
+          echo "base_image=${BASE_TAG}" >> "$GITHUB_OUTPUT"
+
+          # Resolve current linux/amd64 digest of upstream jellyfin/jellyfin
+          RAW=$(docker buildx imagetools inspect --raw "docker.io/${BASE_TAG}")
+          UPSTREAM_DIGEST=$(echo "$RAW" | jq -r '(.manifests[]? | select(.platform.os=="linux" and .platform.architecture=="amd64") | .digest) // empty' | head -n1)
+          if [ -z "$UPSTREAM_DIGEST" ]; then
+            UPSTREAM_DIGEST=$(docker buildx imagetools inspect "docker.io/${BASE_TAG}" | awk '/^Digest:/{print $2; exit}')
+          fi
+          echo "upstream_digest=${UPSTREAM_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Upstream ${BASE_TAG} amd64 digest: ${UPSTREAM_DIGEST}"
+
+          # Always build on pushes, tags, or manual runs
+          if [ "${GITHUB_EVENT_NAME}" != "schedule" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # On scheduled runs, read the recorded base digest from our published GHCR image (no image pull)
+          JF_VER="${BASE_TAG#jellyfin/jellyfin:}"
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:dumbkid234/jellyfin.pgsql:pull" | jq -r '.token')
+          MANIFEST=$(curl -fsSL -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/dumbkid234/jellyfin.pgsql/manifests/${JF_VER}" 2>/dev/null || true)
+
+          # If OCI index (manifest list), follow the linux/amd64 manifest
+          AMD64_MANIFEST_DIGEST=$(echo "$MANIFEST" | jq -r '(.manifests[]? | select(.platform.os=="linux" and .platform.architecture=="amd64") | .digest) // empty' | head -n1)
+          if [ -n "$AMD64_MANIFEST_DIGEST" ]; then
+            MANIFEST=$(curl -fsSL -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/dumbkid234/jellyfin.pgsql/manifests/${AMD64_MANIFEST_DIGEST}" 2>/dev/null || true)
+          fi
+
+          CONFIG_DIGEST=$(echo "$MANIFEST" | jq -r '.config.digest // empty')
+          CURRENT_DIGEST=""
+          if [ -n "$CONFIG_DIGEST" ]; then
+            CURRENT_DIGEST=$(curl -fsSL -H "Authorization: Bearer ${TOKEN}" \
+              "https://ghcr.io/v2/dumbkid234/jellyfin.pgsql/blobs/${CONFIG_DIGEST}" | jq -r '.config.Labels["org.opencontainers.image.base.digest"] // empty')
+          fi
+          echo "Published image base digest: ${CURRENT_DIGEST:-<none>}"
+
+          if [ -n "$UPSTREAM_DIGEST" ] && [ "$UPSTREAM_DIGEST" = "$CURRENT_DIGEST" ]; then
+            echo "Upstream Jellyfin image unchanged. Skipping rebuild."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream Jellyfin image updated! Triggering rebuild."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Compute Docker tags
+        if: steps.check.outputs.should_build == 'true'
         id: tags
         run: |
           BASE="ghcr.io/dumbkid234/jellyfin.pgsql"
@@ -43,26 +99,32 @@ jobs:
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
           else
-            echo "jf_ver=12.4" >> "$GITHUB_OUTPUT"
+            JF_VER="${{ steps.check.outputs.base_image }}"
+            JF_VER="${JF_VER#jellyfin/jellyfin:}"
+            echo "jf_ver=${JF_VER}" >> "$GITHUB_OUTPUT"
             {
               echo "list<<EOF"
-              echo "${BASE}:12.4"
+              echo "${BASE}:${JF_VER}"
               echo "${BASE}:latest"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build and push image
+        if: steps.check.outputs.should_build == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.base.name=docker.io/${{ steps.check.outputs.base_image }}
+            org.opencontainers.image.base.digest=${{ steps.check.outputs.upstream_digest }}
           tags: ${{ steps.tags.outputs.list }}
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: steps.check.outputs.should_build == 'true' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
